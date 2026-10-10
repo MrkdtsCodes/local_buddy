@@ -64,16 +64,29 @@ if ($card) {
     exit;
 }
 
+// ---- Cache: if the AI already answered this exact question, reuse it ----
+$cacheFile = __DIR__ . '/cache.json';
+$cache = file_exists($cacheFile) ? (json_decode(file_get_contents($cacheFile), true) ?: []) : [];
+$key = md5(strtolower($question));
+
+if (isset($cache[$key])) {
+    $hit = $cache[$key];
+    $hit['cached'] = true;
+    echo json_encode($hit);
+    exit;
+}
+
+// ---- AI fallback (Linux Mint / Ubuntu only) ----
 $body = [
     "model"      => "qwen2.5-coder:1.5b",
     "stream"     => false,
     "keep_alive" => "30m",
     "messages"   => [
-        ["role" => "system", "content" => "You are a Linux helper for beginners on Linux Mint. Reply with exactly two lines: the command, then one short sentence explaining it. Nothing else."],
+        ["role" => "system", "content" => "You are a Linux helper for beginners on Linux Mint (Ubuntu-based). Use apt for software, never yum, dnf or pacman. Reply with exactly two lines: the command, then one short sentence. Nothing else."],
         ["role" => "user", "content" => "how do I check disk space"],
         ["role" => "assistant", "content" => "df -h\nShows free and used space on each disk."],
-        ["role" => "user", "content" => "how do I see my ip address"],
-        ["role" => "assistant", "content" => "ip a\nLists your network interfaces and their IP addresses."],
+        ["role" => "user", "content" => "how do I install vlc"],
+        ["role" => "assistant", "content" => "sudo apt install vlc\nInstalls the VLC media player."],
         ["role" => "user", "content" => $question]
     ],
     "options"    => [
@@ -119,6 +132,9 @@ $lines = array_values(array_filter(
     fn($l) => $l !== '' && !in_array(strtolower($l), ['bash', 'sh', 'shell'])
 ));
 
+// Package managers from other distros: never show these on Mint / Ubuntu
+$otherDistros = '/\b(yum|dnf|pacman|zypper|apk|emerge|rpm|brew)\b/i';
+
 $command = '';
 $explanation = '';
 foreach ($lines as $i => $line) {
@@ -126,6 +142,8 @@ foreach ($lines as $i => $line) {
     $fw = strtok($cand, ' ');
     // skip sentences: they start with a capital letter or end with . or :
     if ($fw === false || !preg_match('/^[a-z.\/]/', $cand) || preg_match('/[A-Za-z0-9][.:]$/', $cand)) continue;
+    // skip commands from other distros (also catches "sudo dnf ...")
+    if (preg_match($otherDistros, $cand)) continue;
     if (trim((string) shell_exec('command -v ' . escapeshellarg($fw) . ' 2>/dev/null')) !== '') {
         $command = $cand;
         $explanation = mb_substr(preg_replace('/^Explanation:\s*/i', '', $lines[$i + 1] ?? ''), 0, 120);
@@ -158,6 +176,7 @@ $dangerPatterns = [
     '/>\s*\/dev\/sd/i',
     '/:\(\)\s*\{/',
     '/\bsudo\s+rm\b/i',
+    '/\bapt(-get)?\s+(remove|purge|autoremove)\b/i',   // removing software
 ];
 
 $dangerous = false;
@@ -168,9 +187,14 @@ foreach ($dangerPatterns as $p) {
     }
 }
 
-echo json_encode([
+$final = [
     'command'     => $command,
     'explanation' => $explanation,
     'dangerous'   => $dangerous,
     'source'      => 'ai'
-]);
+];
+
+$cache[$key] = $final;
+file_put_contents($cacheFile, json_encode($cache), LOCK_EX);
+
+echo json_encode($final);
